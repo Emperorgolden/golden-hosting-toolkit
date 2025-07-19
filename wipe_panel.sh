@@ -1,6 +1,19 @@
 #!/bin/bash
 
-echo "Golden Hosting Service Toolkit initializing..."
+# === COLORIZED BANNER ===
+function banner() {
+  clear
+  echo -e "\033[1;33m███████╗ ██████╗ ██╗     ██████╗ ███████╗███╗   ██╗\033[0m"
+  echo -e "\033[1;31m██╔════╝██╔═══██╗██║     ██╔══██╗██╔════╝████╗  ██║\033[0m"
+  echo -e "\033[1;34m█████╗  ██║   ██║██║     ██║  ██║█████╗  ██╔██╗ ██║\033[0m"
+  echo -e "\033[1;31m██╔══╝  ██║   ██║██║     ██║  ██║██╔══╝  ██║╚██╗██║\033[0m"
+  echo -e "\033[1;33m██║     ╚██████╔╝███████╗██████╔╝███████╗██║ ╚████║\033[0m"
+  echo -e "\033[1;34m╚═╝      ╚═════╝ ╚══════╝╚═════╝ ╚══════╝╚═╝  ╚═══╝\033[0m"
+  echo -e "         \033[1;35mGolden Hosting Service Toolkit\033[0m"
+  echo
+}
+
+banner
 
 # === Root Check ===
 if [ "$(id -u)" -ne 0 ]; then
@@ -8,29 +21,39 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# === SYSTEM UPDATE (Pre & Post Purge) ===
+# === SYSTEM UPDATE (Pre & Post) ===
 function update_system() {
     echo "[+] Checking for system updates..."
-    if command -v apt >/dev/null 2>&1; then
+    if command -v apt >/dev/null; then
         apt update -y && apt upgrade -y
-    elif command -v yum >/dev/null 2>&1; then
+    elif command -v yum >/dev/null; then
         yum update -y
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf upgrade --refresh -y
+    elif command -v dnf >/dev/null; then
+        dnf upgrade -y
     else
-        echo "[!] Package manager not found. Skipping updates."
+        echo "[!] Unknown package manager. Skipping update."
     fi
 }
 
 update_system
 
-# === MYSQL Nuclear Protocol ===
+# === MYSQL Nuker ===
 echo "[+] Connecting to MySQL..."
 
 MYSQL_CMD="mysql -u root -p"
 
 read -s -p "Enter MySQL root password: " MYSQL_PASS
 echo
+
+function safe_exec() {
+    CMD="$1"
+    OUTPUT=$($MYSQL_CMD -p"$MYSQL_PASS" -e "$CMD" 2>&1)
+    if [[ "$OUTPUT" == *"ERROR 1396"* ]]; then
+        echo "[!] Skipped nonexistent user or duplicate error."
+    elif [[ "$OUTPUT" == *"ERROR"* ]]; then
+        echo "[!] MySQL error: $OUTPUT"
+    fi
+}
 
 function nuke_mysql() {
     DBS=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SHOW DATABASES;" 2>/dev/null)
@@ -39,23 +62,25 @@ function nuke_mysql() {
     for DB in $DBS; do
         if [[ "$DB" != "mysql" && "$DB" != "information_schema" && "$DB" != "performance_schema" && "$DB" != "sys" ]]; then
             echo "[*] Dropping DB: $DB"
-            $MYSQL_CMD -p"$MYSQL_PASS" -e "DROP DATABASE \`$DB\`;"
+            safe_exec "DROP DATABASE \`$DB\`;"
         fi
     done
 
     while read -r USER HOST; do
-        echo "[*] Dropping MySQL user: '$USER'@'$HOST'"
-        $MYSQL_CMD -p"$MYSQL_PASS" -e "DROP USER '$USER'@'$HOST';"
+        if [[ -n "$USER" && -n "$HOST" ]]; then
+            echo "[*] Dropping user: '$USER'@'$HOST'"
+            safe_exec "DROP USER '$USER'@'$HOST';"
+        fi
     done <<< "$USERS"
 
-    $MYSQL_CMD -p"$MYSQL_PASS" -e "FLUSH PRIVILEGES;"
+    safe_exec "FLUSH PRIVILEGES;"
     echo "[+] MySQL purge complete."
 }
 
 nuke_mysql
 
-# === Panel Daemon & File Kill ===
-echo "[+] Locating panel remnants..."
+# === Service and File Destruction ===
+echo "[+] Killing panel daemons and purging directories..."
 
 SERVICES=("pteroq" "pterodactyl" "wings")
 for svc in "${SERVICES[@]}"; do
@@ -77,26 +102,20 @@ done
 
 rm -f /etc/nginx/sites-enabled/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf
 rm -f /etc/apache2/sites-enabled/panel.conf /etc/apache2/sites-available/panel.conf
-
 find /var/log -name "*pterodactyl*" -exec rm -f {} \;
 
-# === Final Verification ===
-echo "[+] Verifying purge..."
+# === Final Check ===
+echo "[+] Verifying..."
 
 LEFT_DB=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SHOW DATABASES;" 2>/dev/null | grep -v -E 'mysql|information_schema|performance_schema|sys')
 LEFT_USERS=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SELECT User FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint');" 2>/dev/null)
 
 if [ -z "$LEFT_DB" ] && [ -z "$LEFT_USERS" ]; then
-    echo "[✓] Databases and users: Clean."
+    echo -e "\033[1;32m[✓] Golden Hosting Toolkit: All clean. System sanitized.\033[0m"
 else
-    echo "[!] Warning: Residuals detected."
-    echo "Databases left:"
+    echo -e "\033[1;31m[!] Residual MySQL objects detected:\033[0m"
     echo "$LEFT_DB"
-    echo "Users left:"
     echo "$LEFT_USERS"
 fi
 
-# === Final System Update (to hide tracks) ===
 update_system
-
-echo "Golden Hosting Service Toolkit: All clean. System up to date and sanitized."
