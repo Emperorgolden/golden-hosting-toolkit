@@ -8,7 +8,7 @@ BLU='\033[1;34m'
 MAG='\033[1;35m'
 RST='\033[0m'
 
-# === MEDIUM-SIZE BANNER ===
+# === BANNER ===
 function banner() {
   clear
   echo -e "${YEL}╔═══════════════════════════════════════╗${RST}"
@@ -20,7 +20,7 @@ function banner() {
 
 banner
 
-# === Root Check ===
+# === ROOT CHECK ===
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}[!] Must be run as root. Exiting.${RST}"
     exit 1
@@ -42,17 +42,29 @@ function update_system() {
 
 update_system
 
-# === MYSQL Setup ===
-echo -e "${MAG}[+] Connecting to MySQL...${RST}"
+# === MYSQL AUTO-DETECT AUTH ===
+echo -e "${MAG}[+] Testing MySQL root connection without password...${RST}"
+if mysql -u root -e "SELECT VERSION();" >/dev/null 2>&1; then
+    MYSQL_CMD="mysql -u root"
+    echo -e "${GRN}[✓] Connected using no password.${RST}"
+else
+    echo -e "${YEL}[!] No passwordless access. Prompting for MySQL root password.${RST}"
+    read -s -p "Enter MySQL root password: " MYSQL_PASS
+    echo
+    MYSQL_CMD="mysql -u root -p$MYSQL_PASS"
 
-MYSQL_CMD="mysql -u root -p"
+    if ! $MYSQL_CMD -e "SELECT VERSION();" >/dev/null 2>&1; then
+        echo -e "${RED}[X] Unable to authenticate with provided password. Exiting.${RST}"
+        exit 1
+    else
+        echo -e "${GRN}[✓] Connected using password.${RST}"
+    fi
+fi
 
-read -s -p "Enter MySQL root password: " MYSQL_PASS
-echo
-
+# === SAFE EXEC WRAPPER ===
 function safe_exec() {
     CMD="$1"
-    OUTPUT=$($MYSQL_CMD -p"$MYSQL_PASS" -e "$CMD" 2>&1)
+    OUTPUT=$($MYSQL_CMD -e "$CMD" 2>&1)
     if [[ "$OUTPUT" == *"ERROR 1396"* ]]; then
         echo -e "${YEL}[!] Skipped nonexistent user.${RST}"
     elif [[ "$OUTPUT" == *"ERROR"* ]]; then
@@ -60,9 +72,10 @@ function safe_exec() {
     fi
 }
 
+# === MYSQL WIPE ===
 function nuke_mysql() {
-    DBS=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SHOW DATABASES;" 2>/dev/null)
-    USERS=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SELECT User, Host FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint');" 2>/dev/null)
+    DBS=$($MYSQL_CMD -N -e "SHOW DATABASES;" 2>/dev/null)
+    USERS=$($MYSQL_CMD -N -e "SELECT User, Host FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint');" 2>/dev/null)
 
     for DB in $DBS; do
         if [[ "$DB" != "mysql" && "$DB" != "information_schema" && "$DB" != "performance_schema" && "$DB" != "sys" ]]; then
@@ -84,13 +97,13 @@ function nuke_mysql() {
 
 nuke_mysql
 
-# === PANEL PURGE ===
-echo -e "${MAG}[+] Killing panel services and deleting files...${RST}"
+# === SERVICE KILL + FILE PURGE ===
+echo -e "${MAG}[+] Killing panel services and purging files...${RST}"
 
 SERVICES=("pteroq" "pterodactyl" "wings")
 for svc in "${SERVICES[@]}"; do
     if systemctl list-units --type=service | grep -q "$svc"; then
-        echo -e "${YEL}[*] Disabling service: $svc${RST}"
+        echo -e "${YEL}[*] Stopping service: $svc${RST}"
         systemctl stop "$svc"
         systemctl disable "$svc"
         rm -f "/etc/systemd/system/$svc.service"
@@ -109,16 +122,15 @@ rm -f /etc/nginx/sites-enabled/pterodactyl.conf /etc/nginx/sites-available/ptero
 rm -f /etc/apache2/sites-enabled/panel.conf /etc/apache2/sites-available/panel.conf
 find /var/log -name "*pterodactyl*" -exec rm -f {} \;
 
-# === Final Verifications ===
-echo -e "${BLU}[+] Final database and user check...${RST}"
-
-LEFT_DB=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SHOW DATABASES;" 2>/dev/null | grep -v -E 'mysql|information_schema|performance_schema|sys')
-LEFT_USERS=$($MYSQL_CMD -p"$MYSQL_PASS" -N -e "SELECT User FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint');" 2>/dev/null)
+# === VERIFY ===
+echo -e "${BLU}[+] Final database/user check...${RST}"
+LEFT_DB=$($MYSQL_CMD -N -e "SHOW DATABASES;" 2>/dev/null | grep -v -E 'mysql|information_schema|performance_schema|sys')
+LEFT_USERS=$($MYSQL_CMD -N -e "SELECT User FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint');" 2>/dev/null)
 
 if [ -z "$LEFT_DB" ] && [ -z "$LEFT_USERS" ]; then
     echo -e "${GRN}[✓] Golden Hosting Toolkit: All clean. System sanitized.${RST}"
 else
-    echo -e "${RED}[!] Warning: Residuals found.${RST}"
+    echo -e "${RED}[!] Residuals found:${RST}"
     echo -e "${YEL}Databases:${RST} $LEFT_DB"
     echo -e "${YEL}Users:${RST} $LEFT_USERS"
 fi
