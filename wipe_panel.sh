@@ -29,20 +29,12 @@ fi
 # === SYSTEM UPDATE ===
 function update_system() {
     echo -e "${BLU}[+] Checking for system updates...${RST}"
-    if command -v apt >/dev/null; then
-        apt update -y && apt upgrade -y
-    elif command -v yum >/dev/null; then
-        yum update -y
-    elif command -v dnf >/dev/null; then
-        dnf upgrade -y
-    else
-        echo -e "${RED}[!] Unknown package manager. Skipping update.${RST}"
-    fi
+    apt update -y && apt upgrade -y
 }
 
 update_system
 
-# === MYSQL AUTH ===
+# === MYSQL AUTO-CONNECT ===
 echo -e "${MAG}[+] Testing MySQL root connection without password...${RST}"
 if mysql -u root -e "SELECT VERSION();" >/dev/null 2>&1; then
     MYSQL_CMD="mysql -u root"
@@ -52,42 +44,51 @@ else
     read -s -p "Enter MySQL root password: " MYSQL_PASS
     echo
     MYSQL_CMD="mysql -u root -p$MYSQL_PASS"
-
     if ! $MYSQL_CMD -e "SELECT VERSION();" >/dev/null 2>&1; then
-        echo -e "${RED}[X] Unable to authenticate with provided password. Exiting.${RST}"
+        echo -e "${RED}[X] Cannot authenticate to MySQL. Exiting.${RST}"
         exit 1
-    else
-        echo -e "${GRN}[✓] Connected using password.${RST}"
     fi
+    echo -e "${GRN}[✓] Connected using password.${RST}"
 fi
 
-# === SAFE EXECUTION ===
+# === SAFE MYSQL EXEC ===
 function safe_exec() {
-    CMD="$1"
-    OUTPUT=$($MYSQL_CMD -e "$CMD" 2>&1)
-    if [[ "$OUTPUT" == *"ERROR 1396"* ]]; then
-        echo -e "${YEL}[!] Skipped: $CMD (User exists or corrupted)${RST}"
-    elif [[ "$OUTPUT" == *"ERROR"* ]]; then
-        echo -e "${RED}[!] MySQL error:\n$CMD\n--------------\n$OUTPUT${RST}"
+    local query="$1"
+    OUTPUT=$($MYSQL_CMD -e "$query" 2>&1)
+    if [[ "$OUTPUT" == *"ERROR"* ]]; then
+        echo -e "${RED}[!] MySQL error:\n$query\n$OUTPUT${RST}"
     fi
 }
 
-# === DEEP MYSQL WIPE ===
+# === FIX DEFINER ISSUES ===
+function fix_definers() {
+    echo -e "${MAG}[+] Checking for invalid DEFINER entries...${RST}"
+    DEFINERS=$($MYSQL_CMD -N -e "SELECT CONCAT(ROUTINE_TYPE, ' ', ROUTINE_SCHEMA, '.', ROUTINE_NAME) FROM information_schema.ROUTINES WHERE DEFINER NOT LIKE '%@localhost' AND ROUTINE_SCHEMA NOT IN ('mysql', 'performance_schema', 'information_schema', 'sys');")
+
+    for item in $DEFINERS; do
+        TYPE=$(echo $item | awk '{print $1}')
+        NAME=$(echo $item | awk '{print $2}')
+        FIX="ALTER $TYPE $NAME DEFINER='root@localhost';"
+        safe_exec "$FIX"
+    done
+}
+
+# === MYSQL NUKE ===
 function nuke_mysql() {
     DBS=$($MYSQL_CMD -N -e "SHOW DATABASES;" 2>/dev/null)
-    USERS=$($MYSQL_CMD -N -e "SELECT User, Host FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint','admin');" 2>/dev/null || echo "")
+    USERS=$($MYSQL_CMD -N -e "SELECT User, Host FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint','admin');" 2>/dev/null)
 
     for DB in $DBS; do
         if [[ "$DB" != "mysql" && "$DB" != "information_schema" && "$DB" != "performance_schema" && "$DB" != "sys" ]]; then
             echo -e "${YEL}[*] Dropping DB: $DB${RST}"
-            safe_exec "DROP DATABASE \\`$DB\\`;"
+            safe_exec "DROP DATABASE \`$DB\`;"
         fi
     done
 
     while read -r USER HOST; do
         if [[ -n "$USER" && -n "$HOST" ]]; then
             echo -e "${YEL}[*] Dropping user: '$USER'@'$HOST'${RST}"
-            safe_exec "DROP USER IF EXISTS '$USER'@'$HOST';"
+            safe_exec "DROP USER '$USER'@'$HOST';"
         fi
     done <<< "$USERS"
 
@@ -95,66 +96,52 @@ function nuke_mysql() {
     echo -e "${GRN}[+] MySQL purge complete.${RST}"
 }
 
-nuke_mysql
-
-# === FIX DEFINER ERRORS ===
-function fix_definers() {
-    echo -e "${MAG}[+] Checking for invalid DEFINER entries...${RST}"
-    DEFINERS=$($MYSQL_CMD -N -e "SELECT CONCAT(ROUTINE_TYPE, ' ', ROUTINE_SCHEMA, '.', ROUTINE_NAME) FROM information_schema.ROUTINES WHERE DEFINER LIKE 'mariadb.sys@localhost';" 2>/dev/null)
-    for ITEM in $DEFINERS; do
-        TYPE=$(echo $ITEM | cut -d' ' -f1)
-        FULL=$(echo $ITEM | cut -d' ' -f2)
-        echo -e "${YEL}[*] Fixing DEFINER on: $FULL${RST}"
-        safe_exec "DROP $TYPE $FULL;"
+# === ENSURE ADMIN USER ===
+function ensure_admin_user() {
+    echo -e "${MAG}[+] Ensuring 'admin' MySQL user exists properly...${RST}"
+    HOSTS=("localhost" "127.0.0.1" "$(hostname -f)")
+    for host in "${HOSTS[@]}"; do
+        echo -e "${YEL}[*] Creating user: 'admin'@$host${RST}"
+        $MYSQL_CMD -e "DROP USER IF EXISTS 'admin'@'$host';" 2>/dev/null
+        $MYSQL_CMD -e "CREATE USER 'admin'@'$host' IDENTIFIED BY 'admin';" 2>/dev/null
+        $MYSQL_CMD -e "GRANT ALL PRIVILEGES ON *.* TO 'admin'@'$host' WITH GRANT OPTION;" 2>/dev/null
     done
+    $MYSQL_CMD -e "FLUSH PRIVILEGES;"
 }
 
-fix_definers
-
-# === REMOVE PANEL FILES & SERVICES ===
+# === KILL PANEL SERVICES ===
 echo -e "${MAG}[+] Killing panel services and purging files...${RST}"
 SERVICES=("pteroq" "pterodactyl" "wings")
 for svc in "${SERVICES[@]}"; do
     systemctl stop "$svc" 2>/dev/null
     systemctl disable "$svc" 2>/dev/null
     rm -f "/etc/systemd/system/$svc.service"
-    systemctl daemon-reload
 done
 
 DIRS=("/var/www/pterodactyl" "/etc/pterodactyl" "/var/lib/pterodactyl" "/srv/daemon" "/srv/wings")
 for dir in "${DIRS[@]}"; do
-    [ -d "$dir" ] && echo -e "${YEL}[*] Removing directory: $dir${RST}" && rm -rf "$dir"
-
+    [ -d "$dir" ] && rm -rf "$dir"
 done
+
 rm -f /etc/nginx/sites-enabled/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf
 rm -f /etc/apache2/sites-enabled/panel.conf /etc/apache2/sites-available/panel.conf
-find /var/log -name "*pterodactyl*" -exec rm -rf {} +
+find /var/log -name "*pterodactyl*" -exec rm -rf {} + 2>/dev/null
 
-# === DOCKER CLEANUP ===
-echo -e "${MAG}[+] Cleaning up Docker containers...${RST}"
+# === DOCKER WIPE ===
+echo -e "${MAG}[+] Cleaning Docker containers, volumes, images...${RST}"
 docker rm -f $(docker ps -aq) 2>/dev/null
-rm -rf /var/lib/docker/containers/*
+docker volume rm $(docker volume ls -q) 2>/dev/null
+docker image rm $(docker images -q) 2>/dev/null
 
-# === RECREATE ADMIN USERS ===
-function recreate_admin_users() {
-  echo -e "${MAG}[+] Ensuring 'admin' MySQL user exists properly...${RST}"
-  HOSTS=("localhost" "127.0.0.1" "$(hostname -f)" "private")
-  for H in "${HOSTS[@]}"; do
-    echo -e "${YEL}[*] Dropping user if exists: 'admin'@'$H'${RST}"
-    safe_exec "DROP USER IF EXISTS 'admin'@'$H';"
-    echo -e "${YEL}[*] Creating user: 'admin'@'$H'${RST}"
-    safe_exec "CREATE USER 'admin'@'$H' IDENTIFIED BY 'admin';"
-    safe_exec "GRANT ALL PRIVILEGES ON *.* TO 'admin'@'$H' WITH GRANT OPTION;"
-  done
-  safe_exec "FLUSH PRIVILEGES;"
-}
+# === EXECUTION ===
+fix_definers
+nuke_mysql
+ensure_admin_user
 
-recreate_admin_users
-
-# === VERIFY FINAL CLEANUP ===
+# === VERIFY ===
 echo -e "${BLU}[+] Final database/user check...${RST}"
 LEFT_DB=$($MYSQL_CMD -N -e "SHOW DATABASES;" 2>/dev/null | grep -v -E 'mysql|information_schema|performance_schema|sys')
-LEFT_USERS=$($MYSQL_CMD -N -e "SELECT CONCAT(User, '@', Host) FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint','admin');" 2>/dev/null || echo "")
+LEFT_USERS=$($MYSQL_CMD -N -e "SELECT User FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint','admin');" 2>/dev/null)
 
 if [ -z "$LEFT_DB" ] && [ -z "$LEFT_USERS" ]; then
     echo -e "${GRN}[✓] Golden Hosting Toolkit: All clean. System sanitized.${RST}"
