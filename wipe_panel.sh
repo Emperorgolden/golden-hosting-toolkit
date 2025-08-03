@@ -2,7 +2,7 @@
 
 # ================= CONFIGURATION =================
 # Personalization
-YOUR_NAME="YOUR_NAME_HERE"  # <-- Put your name here
+YOUR_NAME="Golden Hosting"
 
 # Color codes
 RED='\033[0;31m'
@@ -19,36 +19,33 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/cleanup_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Subtle loading characters
+# Loading animation
 LOADING_CHARS=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-CHINESE_CHARS=("运" "行" "中" "请" "等" "待" "加" "载" "完" "成")
+CHINESE_CHARS=("清" "理" "中" "请" "稍" "等" "片" "刻" "完" "成")
 
 # ================= CORE FUNCTIONS =================
 display_header() {
     clear
     echo -e "${PURPLE}╔═══════════════════════════════════════╗"
-    echo -e "║     ${YELLOW}GOLDEN HOSTING TOOLKIT v2.2${PURPLE}       ║"
-    echo -e "║   ${CYAN}Forensic VPS Cleaner - Light Ed.${PURPLE}   ║"
+    echo -e "║     ${YELLOW}GOLDEN HOSTING TOOLKIT v2.3${PURPLE}       ║"
+    echo -e "║   ${CYAN}Forensic VPS Cleaner - Hardcore${PURPLE}     ║"
     echo -e "╚═══════════════════════════════════════╝${NC}"
     echo -e "${BLUE}Operator: ${GREEN}$YOUR_NAME${NC}"
     echo -e "${BLUE}Logfile: ${YELLOW}$LOG_FILE${NC}"
     echo -e "${GREEN}Started: $(date)${NC}\n"
 }
 
-# Subtle loading animation (no full screen takeover)
 show_loading() {
     local pid=$1
     local text=$2
     local delay=0.1
-    
+    local i=0
     while kill -0 $pid 2>/dev/null; do
-        for i in "${!LOADING_CHARS[@]}"; do
-            echo -ne "\r${CHINESE_CHARS[i]} ${LOADING_CHARS[i]} ${YELLOW}$text${NC}   "
-            sleep $delay
-            if ! kill -0 $pid 2>/dev/null; then
-                break 2
-            fi
-        done
+        local zh="${CHINESE_CHARS[i % ${#CHINESE_CHARS[@]}]}"
+        local lo="${LOADING_CHARS[i % ${#LOADING_CHARS[@]}]}"
+        echo -ne "\r$zh $lo ${YELLOW}$text${NC}   "
+        sleep $delay
+        ((i++))
     done
     echo -ne "\r${GREEN}✓ ${text} completed${NC}            \n"
 }
@@ -56,13 +53,10 @@ show_loading() {
 execute_task() {
     local task_name="$1"
     local task_command="$2"
-    
     echo -e "\n${PURPLE}▶ Starting: ${CYAN}$task_name${NC}"
-    $task_command > /dev/null 2>&1 &
+    bash -c "$task_command" &
     local pid=$!
-    
     show_loading $pid "$task_name"
-    
     wait $pid
     return $?
 }
@@ -70,78 +64,73 @@ execute_task() {
 # ================= CLEANUP FUNCTIONS =================
 analyze_system() {
     echo -e "\n${CYAN}🔍 Running Forensic Analysis...${NC}"
-    
-    execute_task "Checking Panel Artifacts" "find /var/www /etc -name '*pterodactyl*' -o -name '*panel*' | grep -v 'golden_hosting'"
-    execute_task "Checking Wings Services" "systemctl list-units --type=service --no-legend | grep -E 'wings|daemon'"
-    execute_task "Checking Database Users" "mysql -e 'SELECT User FROM mysql.user' 2>/dev/null | grep -E 'pterodactyl|panel|wings'"
-    execute_task "Checking System Users" "getent passwd | cut -d: -f1 | grep -E 'pterodactyl|panel|wings|container'"
+    execute_task "Finding Pterodactyl Files" "find /var/www /etc /opt /srv -type f -iname '*pterodactyl*'"
+    execute_task "Checking System Users" "getent passwd | grep -E 'pterodactyl|panel|wings|container'"
+    execute_task "Listing Services" "systemctl list-units --type=service | grep -E 'pterodactyl|wings'"
 }
 
 remove_panel() {
     echo -e "\n${RED}🧹 Removing Panel Components...${NC}"
-    
-    execute_task "Stopping Services" "systemctl stop pteroq.service wings 2>/dev/null"
-    execute_task "Removing Files" "rm -rf /var/www/pterodactyl /etc/pterodactyl /usr/local/bin/wings"
-    execute_task "Cleaning Cron" "crontab -l | grep -v 'pterodactyl' | crontab -"
+    execute_task "Stopping Services" "systemctl stop wings pteroq 2>/dev/null"
+    execute_task "Removing Files" "rm -rf /var/www/pterodactyl /etc/pterodactyl /srv/daemon /usr/local/bin/wings"
+    execute_task "Disabling Services" "systemctl disable wings pteroq 2>/dev/null"
+    execute_task "Cleaning Cronjobs" "crontab -l | grep -v 'pterodactyl' | crontab -"
 }
 
-remove_databases() {
-    echo -e "\n${RED}🗑️ Cleaning Databases...${NC}"
-    
-    if ! command -v mysql &>/dev/null; then
-        echo -e "${YELLOW}MySQL not installed, skipping${NC}"
+remove_mysql() {
+    echo -e "\n${RED}🗑️ Wiping MySQL Data...${NC}"
+    if ! command -v mysql >/dev/null; then
+        echo -e "${YELLOW}[!] MySQL not found, skipping.${NC}"
         return
     fi
-
-    execute_task "Dropping Databases" "mysql -e 'SHOW DATABASES' | grep -E 'pterodactyl|panel|wings' | xargs -I{} mysql -e 'DROP DATABASE IF EXISTS \`{}\`'"
-    execute_task "Removing Users" "mysql -e 'SELECT User FROM mysql.user' | grep -E 'pterodactyl|panel|wings' | xargs -I{} mysql -e 'DROP USER IF EXISTS \"{}\"@\"%\"; DROP USER IF EXISTS \"{}\"@\"localhost\"; FLUSH PRIVILEGES'"
+    execute_task "Drop User Accounts" "mysql -e \"SELECT CONCAT('DROP USER IF EXISTS \\\\'', User, '\\\'@\\\'', Host, '\\\';') FROM mysql.user WHERE User NOT IN ('mysql.sys','root','mysql.session','debian-sys-maint')\" | mysql"
+    execute_task "Drop Extra Databases" "mysql -e \"SHOW DATABASES\" | grep -Ev 'mysql|information_schema|performance_schema|sys' | xargs -I{} mysql -e 'DROP DATABASE IF EXISTS \`{}\`;'"
 }
 
 remove_users() {
-    echo -e "\n${RED}👥 Removing System Users...${NC}"
-    
-    execute_task "Killing Processes" "for user in $(getent passwd | cut -d: -f1 | grep -E 'pterodactyl|panel|wings|container'); do pkill -9 -u \$user; done"
-    execute_task "Deleting Users" "for user in $(getent passwd | cut -d: -f1 | grep -E 'pterodactyl|panel|wings|container'); do userdel -r \$user 2>/dev/null; done"
+    echo -e "\n${RED}👥 Removing Linux Users...${NC}"
+    execute_task "Killing Panel Users" "pkill -u pterodactyl 2>/dev/null"
+    execute_task "Deleting Users" "userdel -r pterodactyl 2>/dev/null"
+}
+
+docker_cleanup() {
+    echo -e "\n${RED}🐳 Removing Docker Artifacts...${NC}"
+    execute_task "Stopping Docker Containers" "docker stop \$(docker ps -aq) 2>/dev/null"
+    execute_task "Removing Containers & Images" "docker system prune -a -f 2>/dev/null"
 }
 
 system_optimize() {
     echo -e "\n${GREEN}⚡ Optimizing System...${NC}"
-    
-    execute_task "Updating Packages" "apt-get update && apt-get -y upgrade"
-    execute_task "Cleaning Packages" "apt-get -y autoremove && apt-get -y autoclean"
-    execute_task "Cleaning Temp Files" "find /tmp /var/tmp -type f -atime +1 -delete"
+    execute_task "Cleaning APT Cache" "apt-get autoremove -y && apt-get autoclean -y"
+    execute_task "Removing Logs" "find /var/log -type f -name '*.log' -delete"
 }
 
-# ================= MAIN EXECUTION =================
+# ================= MAIN =================
 main() {
-    # Root check
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}✗ This tool must be run as root!${NC}"
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}[✗] Please run as root.${NC}"
         exit 1
     fi
 
     display_header
-
-    # Analysis phase
     analyze_system
 
-    # Confirmation
-    echo -e "\n${RED}⚠ WARNING: Destructive operations will follow!${NC}"
-    read -p "Are you sure you want to continue? (y/N) " -n 1 -r
-    echo
-    [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
+    echo -e "\n${RED}⚠ Confirm you want to fully wipe panel data (y/N):${NC}"
+    read -r CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        echo -e "${YELLOW}Aborted.${NC}"
+        exit 1
+    fi
 
-    # Cleanup phase
     remove_panel
-    remove_databases
+    remove_mysql
     remove_users
+    docker_cleanup
     system_optimize
 
-    # Completion
-    echo -e "\n${GREEN}✅ Cleanup completed successfully!${NC}"
-    echo -e "${CYAN}Detailed log saved to: ${YELLOW}$LOG_FILE${NC}"
-    echo -e "\n${PURPLE}Thank you for using Golden Hosting Toolkit${NC}"
-    echo -e "${BLUE}Operator: ${GREEN}$YOUR_NAME${NC}\n"
+    echo -e "\n${GREEN}✅ Cleanup Complete. VPS is now clean.${NC}"
+    echo -e "${BLUE}Log: ${YELLOW}$LOG_FILE${NC}"
+    echo -e "${CYAN}~ Golden Hosting Toolkit v2.3 ~${NC}"
 }
 
 main
